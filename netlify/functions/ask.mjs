@@ -1,6 +1,3 @@
-const { stream } = require("@netlify/functions");
-const { Readable } = require("stream");
-
 const ROUTER_URL = "https://9router.com";
 const THINKING_BUDGETS = {
     disabled: { type: "disabled" },
@@ -41,22 +38,30 @@ async function* extractTextDeltas(body) {
     }
 }
 
-const handler = stream(async (event) => {
+export default async (req) => {
     // block non-POST operations
-    if (event.httpMethod !== "POST") {
-        return { statusCode: 405, body: JSON.stringify({ error: "Method Not Allowed" }) };
+    if (req.method !== "POST") {
+        return Response.json({ error: "Method Not Allowed" }, { status: 405 });
     }
 
+    let payload;
     try {
-        const { prompt, thinkingLevel } = JSON.parse(event.body || "{}");
-        if (!prompt) {
-            return { statusCode: 400, body: JSON.stringify({ error: "Missing prompt value" }) };
-        }
+        payload = await req.json();
+    } catch {
+        return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
 
-        const thinkingConfig = THINKING_BUDGETS[thinkingLevel || "adaptive"];
+    const { prompt, thinkingLevel } = payload;
+    if (!prompt) {
+        return Response.json({ error: "Missing prompt value" }, { status: 400 });
+    }
 
+    const thinkingConfig = THINKING_BUDGETS[thinkingLevel || "adaptive"];
+
+    let upstream;
+    try {
         // Connect directly to the underlying free pipeline matrix
-        const response = await fetch(ROUTER_URL, {
+        upstream = await fetch(ROUTER_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -66,29 +71,32 @@ const handler = stream(async (event) => {
                 model: "claude-sonnet-4.6",
                 messages: [{ role: "user", content: prompt }],
                 thinking: thinkingConfig,
-                stream: true // Enable continuous data passing to stay under 10s limits
+                stream: true // Enable continuous data passing to stay under execution time limits
             })
         });
-
-        if (!response.ok || !response.body) {
-            return {
-                statusCode: 502,
-                body: JSON.stringify({ error: "Upstream request failed" })
-            };
-        }
-
-        return {
-            statusCode: 200,
-            headers: { "Content-Type": "text/plain; charset=utf-8" },
-            body: Readable.from(extractTextDeltas(response.body))
-        };
-
     } catch (error) {
-        return {
-            statusCode: 500,
-            body: JSON.stringify({ error: "Serverless execution failed", logs: error.message })
-        };
+        return Response.json({ error: "Serverless execution failed", logs: error.message }, { status: 500 });
     }
-});
 
-exports.handler = handler;
+    if (!upstream.ok || !upstream.body) {
+        return Response.json({ error: "Upstream request failed" }, { status: 502 });
+    }
+
+    const textStream = new ReadableStream({
+        async start(controller) {
+            const encoder = new TextEncoder();
+            try {
+                for await (const chunk of extractTextDeltas(upstream.body)) {
+                    controller.enqueue(encoder.encode(chunk));
+                }
+                controller.close();
+            } catch (error) {
+                controller.error(error);
+            }
+        }
+    });
+
+    return new Response(textStream, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+};
