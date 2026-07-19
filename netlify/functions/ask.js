@@ -1,4 +1,5 @@
 const { stream } = require("@netlify/functions");
+const { Readable } = require("stream");
 
 const ROUTER_URL = "https://9router.com";
 const THINKING_BUDGETS = {
@@ -7,7 +8,40 @@ const THINKING_BUDGETS = {
     high: { type: "enabled", budget_tokens: 4096 }
 };
 
-const handler = async (event, context) => {
+// Upstream sends Anthropic-style SSE frames. Simple HTTP clients (e.g. Roblox's
+// HttpService, which blocks until the response is complete and can't parse SSE)
+// just need the finished reply text, so we extract and re-stream that instead.
+async function* extractTextDeltas(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+
+        for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+
+            try {
+                const parsed = JSON.parse(payload);
+                if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
+                    yield parsed.delta.text;
+                }
+            } catch {
+                // ignore malformed/partial SSE frames
+            }
+        }
+    }
+}
+
+const handler = stream(async (event) => {
     // block non-POST operations
     if (event.httpMethod !== "POST") {
         return { statusCode: 405, body: JSON.stringify({ error: "Method Not Allowed" }) };
@@ -36,20 +70,18 @@ const handler = async (event, context) => {
             })
         });
 
-        // Use Netlify's native text stream wrapper to route real-time chunks back down the wire
-        return stream(async (streamResponse) => {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
+        if (!response.ok || !response.body) {
+            return {
+                statusCode: 502,
+                body: JSON.stringify({ error: "Upstream request failed" })
+            };
+        }
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                
-                const chunk = decoder.decode(value, { stream: true });
-                streamResponse.write(chunk);
-            }
-            streamResponse.end();
-        });
+        return {
+            statusCode: 200,
+            headers: { "Content-Type": "text/plain; charset=utf-8" },
+            body: Readable.from(extractTextDeltas(response.body))
+        };
 
     } catch (error) {
         return {
@@ -57,6 +89,6 @@ const handler = async (event, context) => {
             body: JSON.stringify({ error: "Serverless execution failed", logs: error.message })
         };
     }
-};
+});
 
 exports.handler = handler;
