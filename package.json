@@ -1,10 +1,12 @@
 {
   "name": "luau-claude-netlify",
   "version": "1.0.0",
-  "description": "Serverless streaming proxy bringing Claude 4.6 Sonnet to Luau via Netlify",
+  "description": "Serverless Claude chat API for Luau via Netlify",
   "main": "netlify/functions/ask.mjs",
   "scripts": {
     "build": "echo 'No build step required'"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.112.3"
   }
 }
-
